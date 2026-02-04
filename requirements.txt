@@ -1,7 +1,7 @@
 fastapi
 uvicorn
 httpx
-google-genai
-pydantic
-pytest
 python-dotenv
+pydantic
+pydantic-settings
+google-genai
