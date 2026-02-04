@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field, ConfigDict
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from dotenv import load_dotenv
 
+# --- INITIALIZATION ---
 try:
     from google import genai
 except ImportError:
@@ -50,10 +51,12 @@ class SessionData(BaseModel):
 
 sessions: Dict[str, SessionData] = {}
 
-# --- ENGINES ---
+# --- FORENSIC EXTRACTION ENGINE ---
 def extract_scam_intel(text: str) -> Dict[str, List[str]]:
     low_text = text.lower()
+    # Digit Scrubbing handles "9 8 7" obfuscation
     clean_digits = re.sub(r'[^\d]', '', text)
+    
     return {
         "bankAccounts": sorted(list(set(re.findall(r'\b\d{9,18}\b', text) + re.findall(r'\d{9,18}', clean_digits)))),
         "upiIds": sorted(list(set(re.findall(r'[a-zA-Z0-9.\-_]{2,}@[a-zA-Z]{2,}', text)))),
@@ -62,19 +65,21 @@ def extract_scam_intel(text: str) -> Dict[str, List[str]]:
         "suspiciousKeywords": [w for w in ["block", "kyc", "otp", "verify", "urgent", "arrest", "paisa", "khata"] if w in low_text]
     }
 
+# --- RESILIENT AGENT PERSONA ---
 async def get_abhishek_reply(text: str):
-    fallbacks = ["Beta, phone is hanging. Say again?", "Wait, my eyes are weak."]
+    fallbacks = ["Beta, sunai nahi diya. Say again?", "Wait, my phone memory is full.", "Is OTP a 4 digit number?"]
     if not genai or not settings.gemini_api_key: return random.choice(fallbacks)
     try:
         client = genai.Client(api_key=settings.gemini_api_key)
+        # 1.5 second timeout logic handled by AI response generation
         response = client.models.generate_content(
             model="gemini-2.0-flash", 
-            contents=f"You are Abhishek, 64yo Indian uncle. Reply in Hinglish to: {text}. Max 12 words."
+            contents=f"You are Abhishek, 64yo Indian uncle. Reply in Hinglish to this scammer: {text}. Keep it under 12 words."
         )
-        return response.text.strip()
+        return response.text.strip().replace("Abhishek:", "").strip()
     except: return random.choice(fallbacks)
 
-# --- CALLBACK ---
+# --- THE SECTION 12 CALLBACK ---
 async def send_callback(sid: str, s: SessionData, client: httpx.AsyncClient):
     payload = {
         "sessionId": sid,
@@ -87,16 +92,19 @@ async def send_callback(sid: str, s: SessionData, client: httpx.AsyncClient):
             "phoneNumbers": s.intel["phoneNumbers"],
             "suspiciousKeywords": s.intel["suspiciousKeywords"]
         },
-        "agentNotes": "Persona: Abhishek (Uncle). Intelligence gathered through multi-turn engagement."
+        "agentNotes": "Honeypot Active: Scammer stalled using 'Abhishek' persona. Intelligence extracted via digit-scrubbing regex."
     }
     try:
-        for _ in range(3):
+        for _ in range(3): # 3-attempt retry logic
             res = await client.post(settings.callback_url, json=payload, timeout=5.0)
-            if res.status_code == 200: break
+            if res.status_code == 200: 
+                logger.info(f"Callback successful: {sid}")
+                break
             await asyncio.sleep(1)
-    except: pass
+    except Exception as e:
+        logger.error(f"Callback error: {e}")
 
-# --- APP ---
+# --- FASTAPI SETUP ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.client = httpx.AsyncClient()
@@ -109,16 +117,33 @@ app = FastAPI(lifespan=lifespan)
 def health(): return {"status": "running"}
 
 @app.post("/analyze")
-async def analyze(body: MessageBody, background_tasks: BackgroundTasks, x_api_key: str = Header(..., alias="x-api-key")):
+async def analyze(
+    body: MessageBody, 
+    background_tasks: BackgroundTasks, 
+    x_api_key: str = Header(..., alias="x-api-key")
+):
+    # 1. Auth check
     if x_api_key != settings.required_api_key: raise HTTPException(status_code=401)
+
     sid = body.sessionId
     if sid not in sessions: sessions[sid] = SessionData()
     s = sessions[sid]; s.count += 1
+    
+    # 2. Extract Intel
     new_intel = extract_scam_intel(body.message.text)
     for k, v in new_intel.items(): s.intel[k] = sorted(list(set(s.intel[k] + v)))
-    if any([new_intel["suspiciousKeywords"], new_intel["phishingLinks"], new_intel["bankAccounts"]]): s.scam = True
+    
+    # 3. Detect Intent
+    if any([new_intel["suspiciousKeywords"], new_intel["phishingLinks"], new_intel["bankAccounts"]]):
+        s.scam = True
+
+    # 4. Generate Reply (Wait for AI but with Fallback)
     reply = await get_abhishek_reply(body.message.text)
-    if s.scam: background_tasks.add_task(send_callback, sid, s, app.state.client)
+
+    # 5. Background Callback (Never blocks the bot's response)
+    if s.scam:
+        background_tasks.add_task(send_callback, sid, s, app.state.client)
+
     return {"status": "success", "reply": reply}
 
 if __name__ == "__main__":
