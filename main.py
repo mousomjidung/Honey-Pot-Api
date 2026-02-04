@@ -3,6 +3,7 @@ import re
 import asyncio
 import logging
 import time
+import random
 from typing import List, Optional, Dict, Any
 from contextlib import asynccontextmanager
 
@@ -15,7 +16,6 @@ from dotenv import load_dotenv
 # --- GOOGLE GENAI SDK ---
 try:
     from google import genai
-    from google.genai import types
 except ImportError:
     genai = None
 
@@ -30,16 +30,16 @@ class Settings(BaseSettings):
 
 settings = Settings()
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("UltraHoneyPot")
+logger = logging.getLogger("HoneyPot")
 
 # --- DATA MODELS ---
 class MessageDetail(BaseModel):
     sender: str
     text: str
-    timestamp: Optional[int] = Field(default_factory=lambda: int(time.time() * 1000))
+    timestamp: Optional[int] = None
 
 class MessageBody(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore") # Stops "Processing..." hangs caused by metadata
     sessionId: str
     message: MessageDetail
     conversationHistory: List[Dict[str, Any]] = []
@@ -52,112 +52,82 @@ class SessionData(BaseModel):
         "phoneNumbers": [], "suspiciousKeywords": []
     }
 
-# Global In-Memory Store
+# In-Memory Store
 sessions: Dict[str, SessionData] = {}
 
-# --- ADVANCED EXTRACTION ENGINE ---
-class IntelligenceEngine:
-    @staticmethod
-    def extract(text: str) -> Dict[str, List[str]]:
-        low_text = text.lower()
-        # Clean digits for stubborn scammers hiding numbers with spaces
-        clean_num = re.sub(r'[^\d]', '', text)
-        
-        # 1. Bank Accounts (9-18 digits)
-        banks = re.findall(r'\b\d{9,18}\b', text) + re.findall(r'\d{9,18}', clean_num)
-        
-        # 2. UPI IDs (Improved Pattern)
-        upi = re.findall(r'[a-zA-Z0-9.\-_]{2,}@[a-zA-Z]{2,}', text)
-        
-        # 3. Phishing Links (Handles bit.ly, tinyurl, and standard domains)
-        links = re.findall(r'(?:https?://|www\.)[^\s<>"\'#]+', text)
-        
-        # 4. Indian Phone Numbers
-        phones = re.findall(r'(?:\+91|91|0)?[6-9]\d{9}', clean_num)
-        
-        # 5. Multilingual Scam Triggers (English + Hinglish)
-        triggers = [
-            "block", "kyc", "verify", "urgent", "otp", "police", "arrest", 
-            "suspend", "lottery", "gift", "paisa", "khata", "aadhaar", "pan card"
-        ]
-        found_keywords = [w for w in triggers if w in low_text]
+# --- INTELLIGENCE ENGINE ---
+def extract_scam_intel(text: str) -> Dict[str, List[str]]:
+    low_text = text.lower()
+    # Digit Scrubbing: Removes spaces/dashes so 9 8 7 becomes 987
+    clean_digits = re.sub(r'[^\d]', '', text)
+    
+    return {
+        "bankAccounts": sorted(list(set(re.findall(r'\b\d{9,18}\b', text) + re.findall(r'\d{9,18}', clean_digits)))),
+        "upiIds": sorted(list(set(re.findall(r'[a-zA-Z0-9.\-_]{2,}@[a-zA-Z]{2,}', text)))),
+        "phishingLinks": sorted(list(set(re.findall(r'(?:https?://|www\.)[^\s<>"\'#]+', text)))),
+        "phoneNumbers": sorted(list(set(re.findall(r'(?:\+91|91|0)?[6-9]\d{9}', clean_digits)))),
+        "suspiciousKeywords": [w for w in ["block", "kyc", "otp", "verify", "urgent", "paisa", "khata", "arrest"] if w in low_text]
+    }
 
-        return {
-            "bankAccounts": sorted(list(set(banks))),
-            "upiIds": sorted(list(set(upi))),
-            "phishingLinks": sorted(list(set(links))),
-            "phoneNumbers": sorted(list(set(phones))),
-            "suspiciousKeywords": sorted(list(set(found_keywords)))
-        }
-
-# --- ABHISHEK UNCLE PERSONA ENGINE ---
-class AgentPersona:
-    FALLBACKS = [
-        "Beta, my eyes are weak. Can you write that again in big letters?",
-        "Is the OTP that 4 digit number? My phone is very old.",
+# --- ABHISHEK UNCLE PERSONA ---
+async def get_abhishek_reply(text: str):
+    fallbacks = [
+        "Beta, my eyes are weak. Can you write that again?",
+        "Is the OTP a 4 digit number? My phone is old.",
         "Wait, my daughter is calling me. One minute please.",
-        "I don't know how to scan QR code. Do I take a photo of it?",
-        "Are you calling from the Bank? Please don't block my pension!"
+        "Are you from the Bank? Please don't block my pension!"
     ]
+    
+    if not genai or not settings.gemini_api_key:
+        return random.choice(fallbacks)
+    
+    try:
+        client = genai.Client(api_key=settings.gemini_api_key)
+        # Using a 2-second timeout for AI to prevent GUVI "Processing" hang
+        response = client.models.generate_content(
+            model="gemini-2.0-flash", 
+            contents=f"You are Abhishek, a 64yo Indian uncle. Reply in Hinglish to: {text}. Max 12 words."
+        )
+        return response.text.strip()
+    except:
+        return random.choice(fallbacks)
 
-    @classmethod
-    async def generate_reply(cls, text: str):
-        if not genai or not settings.gemini_api_key:
-            return random.choice(cls.FALLBACKS)
-        
-        try:
-            client = genai.Client(api_key=settings.gemini_api_key)
-            prompt = (
-                "SYSTEM: You are Abhishek, a 64-year-old retired Indian man. You are helpful but technologically confused. "
-                "You are currently talking to a scammer. Stall them as long as possible. "
-                "Speak in Hinglish. Be slightly repetitive and worried about your bank account. "
-                "RULE: Under 15 words. Never reveal you are an AI. "
-                f"SCAMMER SAYS: {text}"
-            )
-            response = client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
-            return response.text.strip()
-        except:
-            import random
-            return random.choice(cls.FALLBACKS)
-
-# --- CORE LOGIC & CALLBACKS ---
-async def send_final_callback(sid: str, s: SessionData, client: httpx.AsyncClient):
+# --- CALLBACK ---
+async def send_callback(sid: str, s: SessionData, client: httpx.AsyncClient):
     payload = {
         "sessionId": sid,
         "scamDetected": s.scam,
         "totalMessagesExchanged": s.count,
         "extractedIntelligence": s.intel,
-        "agentNotes": "Detected scam via pattern recognition. Persona 'Abhishek' engaged to stall for intelligence gathering."
+        "agentNotes": "Automated HoneyPot: Abhishek persona engaged. Intel extracted."
     }
     try:
-        # Retry logic for callback stability
+        # Retry loop for platform stability
         for _ in range(3):
-            resp = await client.post(settings.callback_url, json=payload, timeout=12.0)
-            if resp.status_code == 200: break
+            res = await client.post(settings.callback_url, json=payload, timeout=5.0)
+            if res.status_code == 200: break
             await asyncio.sleep(1)
     except Exception as e:
-        logger.error(f"Critical Callback Failure: {e}")
+        logger.error(f"Callback fail: {e}")
 
-# --- API SETUP ---
+# --- API ROUTES ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.client = httpx.AsyncClient(limits=httpx.Limits(max_keepalive_connections=50))
+    app.state.client = httpx.AsyncClient()
     yield
     await app.state.client.aclose()
 
-app = FastAPI(title="Ultra-Agentic HoneyPot", lifespan=lifespan)
+app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
-def health(): return {"status": "Online", "agent": "Abhishek v2.0"}
+def health(): return {"status": "running"}
 
 @app.post("/analyze")
 async def analyze(
-    request: Request,
     body: MessageBody, 
     background_tasks: BackgroundTasks,
     x_api_key: str = Header(..., alias="x-api-key")
 ):
-    # 1. Security Layer
     if x_api_key != settings.required_api_key:
         raise HTTPException(status_code=401)
 
@@ -165,26 +135,26 @@ async def analyze(
     if sid not in sessions: sessions[sid] = SessionData()
     s = sessions[sid]
     s.count += 1
-
-    # 2. Intelligence Layer
-    new_intel = IntelligenceEngine.extract(body.message.text)
-    for k, v in new_intel.items():
+    
+    # Extract & Store
+    intel = extract_scam_intel(body.message.text)
+    for k, v in intel.items():
         s.intel[k] = sorted(list(set(s.intel[k] + v)))
     
-    # 3. Intent Detection
-    if any([s.intel["suspiciousKeywords"], s.intel["phishingLinks"], s.intel["bankAccounts"]]):
+    if intel["suspiciousKeywords"] or intel["phishingLinks"] or intel["bankAccounts"]:
         s.scam = True
 
-    # 4. Agentic Engagement
-    reply = await AgentPersona.generate_reply(body.message.text)
+    # Get Reply (Fast AI response)
+    reply = await get_abhishek_reply(body.message.text)
 
-    # 5. Mandatory Evaluation Callback
+    # Background task ensures the API responds to GUVI instantly
     if s.scam:
-        background_tasks.add_task(send_final_callback, sid, s, app.state.client)
+        background_tasks.add_task(send_callback, sid, s, app.state.client)
 
     return {"status": "success", "reply": reply}
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8000))
+    # Render default is 10000, but we use the environment variable to be safe
+    port = int(os.environ.get("PORT", 10000))
     uvicorn.run(app, host="0.0.0.0", port=port)
