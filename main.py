@@ -4,19 +4,16 @@ import logging
 import random
 import asyncio
 from collections import OrderedDict
-from typing import List, Optional, Dict, Any, Pattern, Set
-from contextlib import asynccontextmanager
+from typing import List, Optional, Dict, Any, Set
 
+from contextlib import asynccontextmanager
 import httpx
-from fastapi import FastAPI, BackgroundTasks, Header, Request, HTTPException, status
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, BackgroundTasks, Header, HTTPException, status
+from pydantic import BaseModel, Field, ConfigDict
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from dotenv import load_dotenv
 
-# --- PYDANTIC V2 UPDATES ---
-from pydantic import BaseModel, Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
-
-# Google GenAI SDK
+# New Google GenAI SDK (v1)
 try:
     from google import genai
     from google.genai import types
@@ -29,25 +26,32 @@ load_dotenv()
 # --- CONFIGURATION ---
 class Settings(BaseSettings):
     gemini_api_key: Optional[str] = Field(None, alias="GEMINI_API_KEY")
-    callback_url: str = Field("https://hackathon.guvi.in/api/updateHoneyPotFinalResult", alias="CALLBACK_URL")
-    model_candidates: List[str] = Field(
-        default_factory=lambda: ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"],
-        alias="MODEL_CANDIDATES",
-    )
-    required_api_key: str = Field("zero-day-101", alias="REQUIRED_API_KEY")
-    max_sessions: int = Field(500, alias="MAX_SESSIONS")
-    callback_only_on_scam: bool = Field(True, alias="CALLBACK_ONLY_ON_SCAM")
-    allowed_origins: Optional[str] = Field("http://localhost", alias="ALLOWED_ORIGINS")
+    callback_url: str = "https://hackathon.guvi.in/api/updateHoneyPotFinalResult"
+    required_api_key: str = "zero-day-101" # Ensure this matches your provided key
+    model_candidates: List[str] = ["gemini-2.0-flash", "gemini-1.5-flash"]
     
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=False)
 
 settings = Settings()
 
-# --- LOGGING ---
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("HoneyPot")
+# --- REQUEST MODELS (Section 6 Compliance) ---
+class MessageDetail(BaseModel):
+    sender: str
+    text: str
+    timestamp: Optional[int] = None
 
-# --- INTELLIGENCE LOGIC ---
+class MessageBody(BaseModel):
+    model_config = ConfigDict(extra="ignore") # Crucial for 'metadata' field
+    
+    sessionId: str
+    message: MessageDetail
+    conversationHistory: List[Dict[str, Any]] = []
+
+class AnalyzeResponse(BaseModel):
+    status: str
+    reply: str
+
+# --- INTEL EXTRACTION ---
 class IntelExtractor:
     PATTERNS = {
         "upi": re.compile(r"[a-zA-Z0-9\.\-_]{3,}@[a-zA-Z]{3,}"),
@@ -55,122 +59,100 @@ class IntelExtractor:
         "url": re.compile(r"(?:https?://|www\.)[^\s<>\"']+"),
         "bank": re.compile(r"\b\d{9,18}\b"),
     }
-    TRIGGERS = {"block", "suspend", "kyc", "expire", "urgent", "police", "verify", "otp", "cbi", "arrest"}
+    TRIGGERS = {"block", "suspend", "kyc", "verify", "otp", "arrest", "urgent", "lottery", "gift"}
 
     @classmethod
     def extract(cls, text: str) -> Dict[str, List[str]]:
-        if not text:
-            return {"bankAccounts": [], "upiIds": [], "phishingLinks": [], "phoneNumbers": [], "suspiciousKeywords": []}
-        text = str(text).lower()
+        text_lower = text.lower()
         return {
-            "bankAccounts": sorted(list(set([n for n in cls.PATTERNS["bank"].findall(text) if len(n) > 8]))),
-            "upiIds": sorted(list(set([u for u in cls.PATTERNS["upi"].findall(text) if "gmail" not in u]))),
-            "phishingLinks": sorted(list(set([l.rstrip(".,") for l in cls.PATTERNS["url"].findall(text)]))),
+            "bankAccounts": sorted(list(set(cls.PATTERNS["bank"].findall(text)))),
+            "upiIds": sorted(list(set(cls.PATTERNS["upi"].findall(text)))),
+            "phishingLinks": sorted(list(set(cls.PATTERNS["url"].findall(text)))),
             "phoneNumbers": sorted(list(set(cls.PATTERNS["phone"].findall(text)))),
-            "suspiciousKeywords": sorted(list(set([w for w in cls.TRIGGERS if w in text]))),
+            "suspiciousKeywords": [w for w in cls.TRIGGERS if w in text_lower]
         }
 
-# --- AI HANDLER ---
-class AIHandler:
-    async def get_reply(self, history: list, text: str) -> str:
-        # Simplified for robustness
-        client = None
-        if settings.gemini_api_key and genai:
-            try:
-                client = genai.Client(api_key=settings.gemini_api_key)
-            except: pass
-        
-        if client:
-            try:
-                prompt = f"Act as Abhishek, a 64yo Indian uncle being scammed. Reply to: {text}. Keep it short."
-                response = client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
-                if response.text: return response.text.replace("Abhishek:", "").strip()
-            except: pass
-        
-        return "Beta, I do not understand. My son will call you."
+# --- SESSION & APP STATE ---
+class SessionData(BaseModel):
+    scam: bool = False
+    intel: Dict[str, List[str]] = {"bankAccounts":[], "upiIds":[], "phishingLinks":[], "phoneNumbers":[], "suspiciousKeywords":[]}
+    count: int = 0
 
-ai_handler = AIHandler()
+sessions: Dict[str, SessionData] = {}
 
-# --- APP ---
+# --- AGENTIC BEHAVIOR (Section 7) ---
+async def get_ai_reply(history: list, current_text: str):
+    if not genai or not settings.gemini_api_key:
+        return "Beta, processing slow hai. What did you say?"
+    
+    client = genai.Client(api_key=settings.gemini_api_key)
+    prompt = (
+        "Role: Abhishek, 64yo Indian Uncle. Scared but talkative. "
+        "Task: Stall a scammer. Use Hinglish. Keep it under 15 words. "
+        f"Scammer said: {current_text}"
+    )
+    
+    try:
+        response = client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
+        return response.text.strip()
+    except:
+        return "Kya? My phone is hanging. Please tell again."
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.client = httpx.AsyncClient(timeout=10.0)
+    app.state.client = httpx.AsyncClient()
     yield
     await app.state.client.aclose()
 
 app = FastAPI(lifespan=lifespan)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# --- CALLBACK ---
-async def send_callback(sid: str, intel: dict, count: int, client: httpx.AsyncClient):
-    payload = {
-        "sessionId": sid,
-        "scamDetected": True, # Always true if we are engaging
-        "totalMessagesExchanged": count,
-        "extractedIntelligence": intel,
-        "agentNotes": "Automated HoneyPot update."
-    }
-    try:
-        await client.post(settings.callback_url, json=payload, timeout=5.0)
-        logger.info(f"Callback sent for {sid}")
-    except Exception as e:
-        logger.error(f"Callback failed: {e}")
-
 # --- ENDPOINTS ---
-@app.get("/")
-def home():
-    return {"status": "running"}
 
-@app.get("/analyze") # Handle GET/HEAD pings
-def analyze_ping():
-    return {"status": "active"}
-
-# NUCLEAR FIX: Use Request object directly to bypass validation errors
-@app.post("/analyze")
-async def analyze_post(request: Request, background_tasks: BackgroundTasks):
-    # 1. Check API Key Manually
-    api_key = request.headers.get("x-api-key")
-    if api_key != settings.required_api_key:
+@app.post("/analyze", response_model=AnalyzeResponse)
+async def analyze(
+    body: MessageBody, 
+    background_tasks: BackgroundTasks,
+    x_api_key: str = Header(..., alias="x-api-key")
+):
+    # 1. Auth Check
+    if x_api_key != settings.required_api_key:
         raise HTTPException(status_code=401, detail="Invalid API Key")
 
-    # 2. Parse JSON safely
-    try:
-        body = await request.json()
-        logger.info(f"DEBUG - RECEIVED BODY: {body}") # <--- LOOK AT THIS IN LOGS
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
+    sid = body.sessionId
+    incoming_text = body.message.text
 
-    # 3. Extract Fields Manually (Forgiving logic)
-    # Handle sessionId being snake_case OR camelCase
-    sid = body.get("sessionId") or body.get("session_id") or "test-session"
+    # 2. Get/Update Session
+    if sid not in sessions:
+        sessions[sid] = SessionData()
     
-    # Handle message structure (nested vs flat)
-    incoming_text = ""
-    msg_obj = body.get("message")
-    if isinstance(msg_obj, dict):
-        incoming_text = msg_obj.get("text", "")
-    elif isinstance(msg_obj, str):
-        incoming_text = msg_obj
-    else:
-        incoming_text = body.get("text") or body.get("input") or ""
+    s = sessions[sid]
+    s.count += 1
+    
+    # 3. Extraction & Scam Detection
+    new_intel = IntelExtractor.extract(incoming_text)
+    for k, v in new_intel.items():
+        s.intel[k] = sorted(list(set(s.intel[k] + v)))
+    
+    if s.intel["suspiciousKeywords"] or s.intel["phishingLinks"]:
+        s.scam = True
 
-    # 4. Process
-    intel = IntelExtractor.extract(str(incoming_text))
-    reply = await ai_handler.get_reply([], str(incoming_text))
+    # 4. Agent Engagement
+    reply = await get_ai_reply(body.conversationHistory, incoming_text)
 
-    # 5. Callback
-    background_tasks.add_task(send_callback, sid, intel, 1, app.state.client)
+    # 5. Mandatory Callback (Section 12)
+    # Logic: If it's a scam, send updates to the platform
+    if s.scam:
+        callback_payload = {
+            "sessionId": sid,
+            "scamDetected": True,
+            "totalMessagesExchanged": s.count,
+            "extractedIntelligence": s.intel,
+            "agentNotes": "Automated detection: Scammer using high-pressure tactics."
+        }
+        background_tasks.add_task(
+            app.state.client.post, 
+            settings.callback_url, 
+            json=callback_payload
+        )
 
-    # 6. Return standard response
-    return {"status": "success", "reply": reply}
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "10000")))
+    return AnalyzeResponse(status="success", reply=reply)
